@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import subprocess
 import threading
 import time
@@ -479,7 +480,7 @@ def _diff_shape_sentence(payload: dict, diagnostics: dict) -> str:
     """
     pct = payload.get("risk_percentile")
     where = (
-        f"bigger than {round(pct)}% of this repo's recent commits"
+        f"bigger than {min(math.floor(pct), 99)}% of this repo's recent commits"
         if pct is not None
         else "unranked (no baseline to compare against)"
     )
