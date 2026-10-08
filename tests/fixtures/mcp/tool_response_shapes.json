@@ -174,10 +174,8 @@
       "reasons": [],
       "status": null
     },
-    "exclude_patterns": [],
     "fix_history": {
       "available": null,
-      "density": null,
       "files": [
         {
           "churn": null,
@@ -251,13 +249,6 @@
     },
     "impacted_tests": {
       "basis": null,
-      "line_coverage": {
-        "covered": [],
-        "no_coverage_data": [],
-        "stale_test_candidates": [],
-        "untested_changes": []
-      },
-      "map_present": null,
       "status": null,
       "summary": null,
       "tests_to_run": [
@@ -266,11 +257,9 @@
       "total": null,
       "truncated": null
     },
-    "is_fix": null,
     "ref": null,
     "review_priority": null,
-    "risk_percentile": null,
-    "working_tree": null
+    "risk_percentile": null
   },
   "get_conformance": {
     "_meta": {

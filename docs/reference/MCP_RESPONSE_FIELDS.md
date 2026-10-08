@@ -241,10 +241,12 @@ Every float is rounded to 4 significant digits. Direct rows' `structural_score` 
 |-------|---------|
 | `directive` | `status` (`review_required`, `review_recommended`, `clear_in_analyzed_scope`, `unknown`), a headline, reasons, next actions |
 | `health_delta` | What the change newly made worse. See below |
-| `risk_percentile`, `review_priority`, `classification`, `is_fix` | The change ranked against the repo's recent commits |
+| `risk_percentile`, `review_priority`, `classification` | The change ranked against the repo's recent commits |
+| `is_fix` | Present only when the change is a bug fix |
+| `exclude_patterns` | Present only when something was excluded: the request's patterns plus `.riskignore` |
 | `diff_shape` | One sentence on size and spread; never a danger verdict |
-| `working_tree` | Whether uncommitted work was the subject |
-| `fix_history` | Recency-weighted bug-fix record of the touched files, with `percentile` and `overlap` |
+| `working_tree` | Present only when `revspec` was omitted: whether uncommitted work was scored, or a clean tree fell back to `HEAD` |
+| `fix_history` | Recency-weighted bug-fix record of the touched files, with `percentile` and `overlap`; the raw `density` ships with `include=["diagnostics"]` |
 | `impacted_tests` | Tests that execute the changed lines |
 | `patch_coverage` | Share of changed executable lines the stored coverage ran |
 | `branch_overlap` | Other branches editing the same files |
@@ -255,7 +257,7 @@ Every float is rounded to 4 significant digits. Direct rows' `structural_score` 
 
 **health_delta.** Both revisions are analysed from their own content, and a finding at head is reported only when the diff explains it. `scope` counts changed, eligible, analysed, skipped and failed files; `status` is `available`, `partial` or `unavailable`, and `partial` is never a clean bill. `introduced`, `worsened` and `resolved` are totals; `top_findings` holds the three most actionable, with `findings_total`. Each finding names `dimension`, `biomarker`, `severity`, `path`, `symbol`, head-side `lines`, a `reason`, and an `attribution` (`basis` of `added_lines`, `changed_symbol`, `changed_call_edge`, `new_file`, `file_change`, `context_change` or `unknown`, with a `confidence`). Identity ignores line numbers, so moved code introduces nothing. `inspect` gives the `finding_id` call that expands one; ids are bound to the two revisions. A finding that matches a stored one carries `health_reference` for `get_health(finding_id=...)`. Performance findings carry `opportunity_id` and are ordered by opportunity rank.
 
-**impacted_tests.** `tests_to_run` names tests the per-test coverage map proves execute the changed lines, capped at ten with `total` and `truncated`. `line_coverage` buckets: `untested_changes`, `stale_test_candidates` (covered lines whose test file is absent from the diff), `covered`, `no_coverage_data`. With no coverage map, `status` is `inferred` when the import graph names test files reaching the change, or `no_map` (run the full suite). `basis` is always present: `measured`, `inferred` or `none`; `tests_to_run_kind` is `test_id` or `test_file`. Build the measured map with `coverage run --contexts=test` and `repowise coverage add`.
+**impacted_tests.** `tests_to_run` names tests the per-test coverage map proves execute the changed lines, capped at ten with `total` and `truncated`. With a coverage map, `map_present` is true and `line_coverage` buckets: `untested_changes`, `stale_test_candidates` (covered lines whose test file is absent from the diff), `covered`, `no_coverage_data`. With no coverage map, `map_present`, `line_coverage` and (unless tests are named) `tests_to_run_kind` are absent, and `status` is `inferred` when the import graph names test files reaching the change, or `no_map` (run the full suite). `basis` is always present: `measured`, `inferred` or `none`; `tests_to_run_kind` is `test_id` or `test_file` whenever `tests_to_run` is filled. Build the measured map with `coverage run --contexts=test` and `repowise coverage add`.
 
 **patch_coverage.** Present when the index stores coverage; the same computation and JSON shape `repowise coverage check --format json` gates on. `patch_coverage_pct` is null when no changed line is executable; files the report never names read `not_in_report`. `scope.freshness` is `stale` when coverage was measured at another commit than the change's head. `path_gates` judges the path-scoped gates in `coverage.gates`. Each file row carries `risk` (`fix_pressure`, `dependents`, `hotspot`, `bug_magnet`, `risky`, `reasons`, `basis`) and up to eight `hints` per uncovered range: `range`, `symbol`, up to three `tests` to extend, and a `basis` of `per_test` (measured), `call_graph` or `import_graph` (inferred). Without a `revspec`, it covers everything a push would bring, diffed from the merge-base with the default base branch.
 
