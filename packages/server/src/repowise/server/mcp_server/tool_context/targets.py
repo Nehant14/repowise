@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from repowise.core.persistence.models import (
 )
 from repowise.server.mcp_server._basis import call_resolution_basis
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
+from repowise.server.mcp_server._edit_sites import reference_edit_set
 from repowise.server.mcp_server._helpers import (
     LIKE_ESCAPE,
     _decision_body,
@@ -53,6 +55,7 @@ from repowise.server.mcp_server._helpers import (
     read_repo_file_text,
 )
 from repowise.server.mcp_server._index_state import index_state_key
+from repowise.server.mcp_server._meta import uncommitted_targets
 from repowise.server.mcp_server._references import path_identity, symbol_identity
 from repowise.server.mcp_server._symbol_lookup import resolve_symbol_rows, symbol_id_variants
 from repowise.server.mcp_server.tool_context.enrichment import (
@@ -379,6 +382,7 @@ async def _resolve_one_target(
     exclude_spec: Any = None,
     repo_root: Any = None,
     collector: OmissionCollector | None = None,
+    as_of_ts: datetime | None = None,
 ) -> dict:
     """Resolve a single target and return its full context."""
     repo_id = repository.id
@@ -608,6 +612,7 @@ async def _resolve_one_target(
                     exclude_spec=exclude_spec,
                     repo_root=repo_root,
                     collector=collector,
+                    as_of_ts=as_of_ts,
                 )
                 if "error" not in card:
                     card["target"] = target
@@ -1017,7 +1022,7 @@ async def _resolve_one_target(
         if triage_meta is not None:
             # Row exposes the selected columns as attributes, which is exactly
             # the shape fix_annotation reads off a full ORM row.
-            fixes = fix_annotation(triage_meta)
+            fixes = fix_annotation(triage_meta, now=as_of_ts)
             if fixes is not None:
                 result_data["fix_history"] = fixes
 
@@ -1231,6 +1236,10 @@ async def _resolve_one_target(
             freshness["confidence_score"] = None
             freshness["freshness_status"] = None
             freshness["is_stale"] = None
+        if file_path_for_git and uncommitted_targets(
+            getattr(repository, "local_path", None), [file_path_for_git]
+        ):
+            freshness["working_tree"] = "modified"
         result_data["freshness"] = freshness
 
     # --- KG layer + tour context (Phase 9) ---
@@ -1282,6 +1291,28 @@ async def _resolve_one_target(
             exclude_spec=exclude_spec,
             collector=collector,
         )
+
+    # --- Reference edit set: every live site naming the symbol ---
+    if include and "references" in include:
+        ref_node = graph_symbol
+        if ref_node is None and target_type == "symbol" and symbol_node_id:
+            res = await session.execute(
+                select(GraphNode).where(
+                    GraphNode.repository_id == repo_id,
+                    GraphNode.node_id.in_(symbol_id_variants(symbol_node_id)),
+                    GraphNode.node_type == "symbol",
+                )
+            )
+            ref_node = min(
+                res.scalars().all(),
+                key=lambda g: (g.node_id != symbol_node_id, g.node_id),
+                default=None,
+            )
+        root = repo_root or getattr(repository, "local_path", None)
+        if ref_node is not None and root:
+            result_data["references"] = await reference_edit_set(session, repo_id, root, ref_node)
+        else:
+            result_data["references_note"] = "references require a symbol target in the graph"
 
     # --- Metrics (replaces get_graph_metrics) ---
     if include and "metrics" in include:

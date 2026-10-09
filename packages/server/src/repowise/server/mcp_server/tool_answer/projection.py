@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from repowise.server.mcp_server.tool_answer.config import (
     _CANDIDATE_FILES_HIGH,
     _CANDIDATE_FILES_MAX,
+    _LARGE_FILE_BYTES,
 )
 
 _COLLECTIONS = (
@@ -289,14 +292,73 @@ def _shape_candidate_files(payload: dict[str, Any], *, expanded: bool) -> None:
     if not isinstance(rows, list):
         return
     cited = {path for path in map(_nav_path, payload.get("citations") or []) if path}
+    spent = cited
+    if payload.get("degraded"):
+        # Keyless citations also name the ranked guesses; they keep their
+        # shortlist slots so citing them reorders the files served, not adds.
+        evidence = set(map(_nav_path, payload.get("symbol_bodies") or []))
+        evidence.update(map(_nav_path, payload.get("code_rationale") or []))
+        spent = cited - (set(map(_nav_path, payload.get("best_guesses") or [])) - evidence)
     paths = [
         path for path in dict.fromkeys(row for row in rows if isinstance(row, str))
-        if path not in cited
+        if path not in spent
     ]
     high = not expanded and _shape_confidence(payload) == "high"
     paths = paths[: _CANDIDATE_FILES_HIGH if high else _CANDIDATE_FILES_MAX]
+    paths = [path for path in paths if path not in cited]
     if paths:
         payload["candidate_files"] = paths
+
+
+# Only the legacy abstain reply points at excerpts; once slimmed there are none.
+_EXCERPT_NOTE = re.compile(r", and its excerpt carries that page's actual content(?=\.)")
+
+
+def _first_guess(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The first ``best_guesses`` row naming a file: what both hints point at."""
+    return next(
+        (
+            row for row in payload.get("best_guesses") or []
+            if isinstance(row, dict) and _nav_path(row)
+        ),
+        None,
+    )
+
+
+def _slim_best_guesses(payload: dict[str, Any], facts: dict[str, Any]) -> bool:
+    """Swap each low-confidence guess's page excerpt for compact facts about its file.
+
+    Rows, keys and order stay; ``excerpt`` returns with ``include=["evidence"]``.
+    The row's own ``why_relevant`` and ``score`` win: they come from the same hit.
+    Returns whether there were rows to slim, so sizes are stamped on those only.
+    """
+    guesses = payload.get("best_guesses")
+    if not isinstance(guesses, list) or not guesses:
+        return False
+    dropped = False
+    for row in guesses:
+        if not isinstance(row, dict):
+            continue
+        dropped |= row.pop("excerpt", None) is not None
+        known = facts.get(_nav_path(row))
+        if not isinstance(known, dict):
+            continue
+        if not row.get("why_relevant") and known.get("why"):
+            row["why"] = known["why"]
+        if known.get("functions"):
+            row["functions"] = known["functions"]
+    first = _first_guess(payload)
+    if dropped:
+        note = payload.get("note")
+        if isinstance(note, str):
+            payload["note"] = _EXCERPT_NOTE.sub("", note)
+        hint = payload.get("next_action_hint")
+        if first and isinstance(hint, str) and hint.startswith("Start from the excerpt of "):
+            payload["next_action_hint"] = (
+                f"Read {_nav_path(first)} first: it scored highest, and best_guesses "
+                "says why each file is in the running."
+            )
+    return True
 
 
 def _default_shape(payload: dict[str, Any], question: str) -> None:
@@ -352,11 +414,76 @@ def _default_shape(payload: dict[str, Any], question: str) -> None:
     )
 
 
+_RANKED_RATIONALE_CHARS = 200
+
+
+def _ranked_list_only(payload: dict[str, Any]) -> bool:
+    """Keyless, weak retrieval and no body: the ranked files are the whole product."""
+    return (
+        payload.get("degraded") == "no-llm-provider"
+        and payload.get("retrieval_quality") == "weak"
+        and payload.get("confidence") == "low"
+        and not payload.get("symbol_bodies")
+        and _first_guess(payload) is not None
+    )
+
+
+def _serve_ranked_list(payload: dict[str, Any]) -> None:
+    """Cut a keyless weak reply to best_guesses, candidate_files and one guidance line.
+
+    A rationale row from the top guess, or one opening with its file's
+    ``why_relevant``, adds nothing; one other row survives, shortened.
+    ``include=["evidence"]`` restores everything.
+    """
+    top = _nav_path(_first_guess(payload))
+    why = {
+        _nav_path(guess): " ".join(_text(guess, "why_relevant", "why").rstrip(".").split())
+        for guess in payload["best_guesses"]
+        if isinstance(guess, dict)
+    }
+
+    def _restates(row: dict[str, Any]) -> bool:
+        path = _nav_path(row)
+        if path == top:
+            return True
+        opening = why.get(path)
+        comment = " ".join(_text(row, "rationale", "comment", "quote", "source", "text").split())
+        return bool(opening) and comment.startswith(opening)
+
+    row = next(
+        (
+            row for row in payload.get("code_rationale") or []
+            if isinstance(row, dict) and not _restates(row)
+        ),
+        None,
+    )
+    payload.pop("code_rationale", None)
+    if row is not None:
+        comment = _text(row, "rationale", "comment", "quote", "source", "text")
+        if len(comment) > _RANKED_RATIONALE_CHARS:
+            comment = comment[:_RANKED_RATIONALE_CHARS].rstrip() + "…"
+        payload["code_rationale"] = [
+            {"path": _path(row), "lines": row.get("lines"), "comment": comment}
+        ]
+    # Every cited path is a guess or a rationale row, so citations would repeat them.
+    for key in ("citations", "note", "next_action_hint"):
+        payload.pop(key, None)
+    if isinstance(payload.get("_meta"), dict):
+        payload["_meta"].pop("hint", None)
+    payload["answer"] = (
+        f"No synthesis ({payload['degraded']}), weak retrieval: best_guesses ranks the "
+        f"likeliest files, {top} first. If none fits, refine with search_codebase."
+    )
+
+
 def _record_reductions(
     payload: dict[str, Any], totals: dict[str, int], *, scope: str | None, repo: str | None,
-    expanded: bool
+    expanded: bool, ranked: bool = False
 ) -> None:
     reduced = False
+    reason = "deduplicated" if expanded else "confidence_projection_and_deduplication"
+    # Ranked shape only: rows summed across every reduced collection.
+    shown = hidden = 0
     for key in _COLLECTIONS:
         # By default ``candidate_files`` carries these paths, so counting the
         # hidden rows would only advertise what the reply already serves.
@@ -366,11 +493,19 @@ def _record_reductions(
         emitted = len(payload.get(key) or []) if isinstance(payload.get(key), list) else 0
         if total <= emitted:
             continue
-        reason = "deduplicated" if expanded else "confidence_projection_and_deduplication"
+        reduced = True
+        if ranked:
+            shown, hidden = shown + emitted, hidden + total
+            continue
         payload[f"{key}_total"] = total
         payload[f"{key}_emitted"] = emitted
         payload[f"{key}_reduced_reason"] = reason
-        reduced = True
+    if ranked and reduced:
+        # One row instead of three sibling counts per collection: the ranked
+        # list is the product, and ``_meta.completeness`` still rolls this up.
+        payload.setdefault("_meta", {}).setdefault("reductions", []).append(
+            {"field": "evidence", "total": hidden, "emitted": shown, "reason": reason}
+        )
     if reduced and not expanded:
         projection = payload.setdefault("_meta", {}).setdefault("projection", {})
         # The caller already holds the question; restating a long one costs
@@ -393,6 +528,14 @@ def project_answer_payload(
     repo: str | None = None, include: list[str] | None = None
 ) -> dict[str, Any]:
     """Return the cache-independent, confidence-specific external response."""
+    return _project(raw, question=question, scope=scope, repo=repo, include=include)[0]
+
+
+def _project(
+    raw: dict[str, Any], *, question: str, scope: str | None,
+    repo: str | None, include: list[str] | None
+) -> tuple[dict[str, Any], bool, bool]:
+    """The projection, whether it slimmed ``best_guesses``, and whether it is the ranked list."""
     payload = copy.deepcopy(raw)
     totals = {
         key: len(payload.get(key) or []) if isinstance(payload.get(key), list) else 0
@@ -400,18 +543,27 @@ def project_answer_payload(
     }
     _deduplicate(payload)
     expanded = "evidence" in set(include or [])
+    facts = payload.pop("_candidate_file_facts", None)
+    slimmed = False
     if not expanded:
         _default_shape(payload, question)
+        if _shape_confidence(payload) == "low":
+            slimmed = _slim_best_guesses(payload, facts if isinstance(facts, dict) else {})
     _shape_candidate_files(payload, expanded=expanded)
     _rewrite_degraded_answer(payload)
+    ranked = not expanded and _ranked_list_only(payload)
+    if ranked:
+        _serve_ranked_list(payload)
     for key in _COLLECTIONS:
         if not payload.get(key):
             payload.pop(key, None)
-    _record_reductions(payload, totals, scope=scope, repo=repo, expanded=expanded)
+    _record_reductions(
+        payload, totals, scope=scope, repo=repo, expanded=expanded, ranked=ranked
+    )
     unknown = sorted(set(include or []) - {"evidence"})
     if unknown:
         payload.setdefault("_meta", {})["ignored_arguments"] = {"include": unknown}
-    return payload
+    return payload, slimmed, ranked
 
 
 def _served_paths(payload: dict[str, Any]) -> list[str]:
@@ -471,6 +623,7 @@ async def _refresh_freshness(payload: dict[str, Any], repo: str | None) -> None:
         "live_head",
         "index_behind",
         "stale_warning",
+        "working_tree_dirty",
         "scope_hint",
     ):
         meta.pop(key, None)
@@ -489,6 +642,79 @@ async def _refresh_freshness(payload: dict[str, Any], repo: str | None) -> None:
         return
     if hint:
         meta["hint"] = hint
+
+
+_LINE_COUNT_MAX_BYTES = 2_000_000
+
+
+def _file_size(root: Path, path: str) -> tuple[int | None, int] | None:
+    """``(lines, size_bytes)`` of a repo file on disk, or None when it is not one.
+
+    Size from ``stat``; lines by streaming, and None above
+    :data:`_LINE_COUNT_MAX_BYTES` so a huge file is never read to count them.
+    """
+    try:
+        abs_path = (root / path).resolve()
+        # An index row is not a trust boundary; refuse anything outside the repo.
+        abs_path.relative_to(root.resolve())
+        if not abs_path.is_file():
+            return None
+        size = abs_path.stat().st_size
+        if size > _LINE_COUNT_MAX_BYTES:
+            return None, size
+        lines, last = 0, b""
+        with abs_path.open("rb") as handle:
+            while chunk := handle.read(65536):
+                lines += chunk.count(b"\n")
+                last = chunk[-1:]
+    except (OSError, ValueError):
+        return None
+    return lines + (1 if last and last != b"\n" else 0), size
+
+
+def _add_file_sizes(payload: dict[str, Any], root: Path | None, *, ranked: bool = False) -> None:
+    """Stamp live ``lines`` / ``size_bytes`` on slimmed guesses and cue a ranged read.
+
+    Serve-time, not cached, so a dirty tree reports the bytes an agent would Read.
+    """
+    if root is None:
+        return
+    for row in payload.get("best_guesses") or []:
+        path = _nav_path(row) if isinstance(row, dict) else None
+        size = _file_size(root, path) if path else None
+        if size is None:
+            continue
+        lines, row["size_bytes"] = size
+        if lines is not None:
+            row["lines"] = lines
+    top = _first_guess(payload)
+    if top and top.get("size_bytes", 0) > _LARGE_FILE_BYTES:
+        path = _nav_path(top)
+        cue = (
+            f"{path} is {top['size_bytes'] // 1024} KB: Read a line range, or call "
+            f"get_context(targets=[\"{path}\"], include=[\"skeleton\"]), "
+            "rather than the whole file."
+        )
+        # The keyless ranked list carries its one guidance line in ``answer``.
+        key = "answer" if ranked else "next_action_hint"
+        hint = payload.get(key)
+        payload[key] = f"{hint.rstrip()} {cue}" if isinstance(hint, str) else cue
+
+
+async def _refresh_file_sizes(
+    payload: dict[str, Any], repo: str | None, *, ranked: bool = False
+) -> None:
+    """Size the slimmed guesses. Best-effort: a sync stat and bounded read of <= 3 files."""
+    if repo == "all":
+        return
+    try:
+        from repowise.server.mcp_server._helpers import _resolve_repo_context
+        from repowise.server.mcp_server.tool_answer.evidence import _repo_root
+
+        root = _repo_root(await _resolve_repo_context(repo))
+    except Exception:
+        return
+    _add_file_sizes(payload, root, ranked=ranked)
 
 
 def _whole_bodies(payload: dict[str, Any]) -> int:
@@ -534,10 +760,12 @@ def projected_answer(fn: Callable[..., Any]) -> Callable[..., Any]:
         include: list[str] | None = None,
     ) -> dict[str, Any]:
         raw = await fn(question=question, scope=scope, repo=repo, include=include)
-        payload = project_answer_payload(
+        payload, slimmed, ranked = _project(
             raw, question=question, scope=scope, repo=repo, include=include
         )
         await _refresh_freshness(payload, repo)
+        if slimmed:
+            await _refresh_file_sizes(payload, repo, ranked=ranked)
         _stamp_completeness(payload)
         return payload
 

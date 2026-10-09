@@ -1061,12 +1061,12 @@ class TestExactMatchSignal:
         assert seen == ["AuthService"]
 
     @pytest.mark.asyncio
-    async def test_exact_hit_sets_true_and_no_note(self, setup_mcp):
+    async def test_exact_hit_sets_true_and_no_fuzzy_note(self, setup_mcp):
         from repowise.server.mcp_server import search_codebase
 
         result = await search_codebase("AuthService", mode="symbol")
         assert result["exact_match"] is True
-        assert "note" not in result
+        assert "exactly matches" not in result.get("note", "")
 
     @pytest.mark.asyncio
     async def test_fuzzy_only_sets_false_with_note(self, setup_mcp):
@@ -1849,3 +1849,334 @@ class TestPathlessPagesInCodeLocationModes:
         )
         pages = [r["page_type"] for r in res["results"] if r["type"] == "page"]
         assert pages == ["module_page"]
+
+
+class TestNamedPathBoost:
+    """A query word that names a file's path lifts that file, by its rarity."""
+
+    def _hits(self, carbon: float, pynput: float) -> list[dict]:
+        return [
+            {"target_path": "services/_hotkey_carbon.py", "relevance_score": carbon},
+            {"target_path": "services/_hotkey_pynput.py", "relevance_score": pynput},
+        ]
+
+    def _boost(self, hits: list[dict], query: str, df: dict, total: int = 854) -> list[str]:
+        from repowise.server.mcp_server._retrieval_rank import boost_named_paths
+
+        boost_named_paths(hits, query, df, total, score_key="relevance_score")
+        hits.sort(key=lambda h: -h["relevance_score"])
+        return [h["target_path"] for h in hits]
+
+    def test_a_rare_path_word_lifts_the_file_it_names(self):
+        df = {"hotkey": 7, "pynput": 1, "backend": 3, "services": 120}
+        order = self._boost(self._hits(2.4, 2.0), "register global hotkey pynput backend", df)
+        assert order[0] == "services/_hotkey_pynput.py"
+
+    def test_a_common_path_word_stays_neutral(self):
+        hits = [{"target_path": "services/a.py", "relevance_score": 1.0}]
+        self._boost(hits, "services registry", {"services": 300})
+        assert hits[0]["relevance_score"] < 1.05
+
+    def test_a_path_match_cannot_beat_a_much_stronger_content_match(self):
+        order = self._boost(self._hits(9.0, 2.0), "hotkey pynput", {"hotkey": 7, "pynput": 1})
+        assert order[0] == "services/_hotkey_carbon.py"
+
+    def test_a_tiny_repo_gets_no_boost(self):
+        hits = self._hits(3.0, 2.0)
+        self._boost(hits, "pynput", {"pynput": 1}, total=12)
+        assert [h["relevance_score"] for h in hits] == [3.0, 2.0]
+
+    def test_extensions_stopwords_and_short_words_never_count(self):
+        from repowise.server.mcp_server._retrieval_rank import path_word_counts, path_words
+
+        assert path_words("src/the/io_utils.json") == {"src", "the", "utils"}
+        assert path_word_counts(["a/models.py", "b/models.ts"])["models"] == 2
+        hits = [{"target_path": "the/py/json.py", "relevance_score": 1.0}]
+        self._boost(hits, "the py io", {"the": 1, "py": 1, "io": 1}, total=100)
+        assert hits[0]["relevance_score"] == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("leg", ["concept", "hybrid"])
+    async def test_search_ranks_the_named_file_first(self, setup_mcp, leg):
+        import repowise.server.mcp_server as mcp_mod
+        from repowise.server.mcp_server import search_codebase
+        from repowise.server.mcp_server._helpers import _resolve_repo_context
+        from repowise.server.mcp_server.tool_search import _search_single_repo
+
+        await _seed_page("file_page:services/_hotkey_carbon.py", "services/_hotkey_carbon.py")
+        await _seed_page("file_page:services/_hotkey_pynput.py", "services/_hotkey_pynput.py")
+        for n in range(30):  # past the tiny-repo floor
+            await _seed_page(f"file_page:pkg/mod_{n}.py", f"pkg/mod_{n}.py")
+
+        async def fake_search(query, limit=10):
+            return [
+                _mk_result(
+                    "file_page:services/_hotkey_carbon.py",
+                    "Register a global hotkey backend, not pynput",
+                    "file_page", "services/_hotkey_carbon.py", 0.9,
+                ),
+                _mk_result(
+                    "file_page:services/_hotkey_pynput.py", "Register a global hotkey backend",
+                    "file_page", "services/_hotkey_pynput.py", 0.8,
+                ),
+            ]
+
+        mcp_mod._vector_store.search = fake_search
+        mcp_mod._fts.search = fake_search
+        query = "register global hotkey pynput backend"
+        if leg == "concept":
+            rows = (await search_codebase(query, mode="concept"))["results"]
+        else:  # the page leg hybrid search runs
+            rows = await _search_single_repo(await _resolve_repo_context(None), query, 5, None)
+        assert (rows[0].get("path") or rows[0]["target_path"]) == "services/_hotkey_pynput.py"
+
+
+class TestPathModeWithWords:
+    def test_path_tokens(self):
+        from repowise.server.mcp_server._query_shape import path_tokens
+
+        assert path_tokens("services/_hotkey_pynput.py register hotkey") == [
+            "services/_hotkey_pynput.py"
+        ]
+        assert path_tokens(r"see `src\a.py:120`, then b.ts.") == [r"src\a.py", "b.ts"]
+        assert path_tokens("register hotkey") == []
+
+    def test_path_tokens_skip_urls_prose_slashes_and_member_suffixes(self):
+        from repowise.server.mcp_server._query_shape import path_tokens
+
+        paths = ["src/client/http.py", "docs/guide.md"]
+        assert path_tokens("see https://x.dev/a.py and/or client/server", paths) == []
+        assert path_tokens("tests/a.py::test_x fails") == ["tests/a.py"]
+        assert path_tokens("look in src/client please", paths) == ["src/client"]
+        assert path_tokens("look in src/client please") == []
+
+    @pytest.mark.asyncio
+    async def test_words_around_a_path_do_not_empty_the_result(self, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        await _seed_page("file_page:services/_hotkey_pynput.py", "services/_hotkey_pynput.py")
+        result = await search_codebase(
+            "services/_hotkey_pynput.py register hotkey", mode="path"
+        )
+        assert [r["file"] for r in result["results"]] == ["services/_hotkey_pynput.py"]
+
+
+class TestSymbolModeExactOnly:
+    @pytest.mark.asyncio
+    async def test_an_exact_match_is_returned_alone(self, session, populated_db, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        _add_symbols(session, populated_db, _WIDGET_ROWS)
+        await session.commit()
+
+        res = await search_codebase("widget", mode="symbol", limit=5)
+        assert sorted(r["symbol_id"] for r in res["results"]) == [
+            "src/widget/core.py::Box.widget",
+            "src/widget/core.py::widget",
+        ]
+        assert res["fuzzy_omitted"] == 3
+        assert res["exact_match"] is True
+        assert res["note"].startswith("3 other symbols contain this name")
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_omitted_counts_past_the_limit(self, session, populated_db, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        _add_symbols(session, populated_db, _WIDGET_ROWS)
+        await session.commit()
+
+        res = await search_codebase("widget", mode="symbol", limit=1)
+        assert len(res["results"]) == 1
+        assert res["results"][0]["name"] == "widget"
+        assert res["fuzzy_omitted"] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_shared_token_is_not_a_name_neighbour(self, session, populated_db, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        _add_symbols(session, populated_db, [
+            ("src/carbon.py", "CarbonRegistrar", "CarbonRegistrar", 1),
+            ("src/tools.py", "carbon_tools", "carbon_tools", 1),
+            ("src/reg.py", "registrar_for", "registrar_for", 1),
+        ])
+        await session.commit()
+
+        res = await search_codebase("CarbonRegistrar", mode="symbol")
+        assert [r["name"] for r in res["results"]] == ["CarbonRegistrar"]
+        assert "fuzzy_omitted" not in res
+        assert "note" not in res
+
+    @pytest.mark.asyncio
+    async def test_no_exact_match_keeps_the_fuzzy_list(self, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        res = await search_codebase("AuthServ", mode="symbol")
+        assert res["results"]
+        assert "fuzzy_omitted" not in res
+        assert "exactly matches" in res["note"]
+
+
+class TestHitSymbols:
+    """File rows name the symbols inside them that the query's words match."""
+
+    @staticmethod
+    async def _seed_symbols(session, rid):
+        from repowise.core.persistence.models import WikiSymbol
+
+        wav = "services/wav_metadata.py"
+        rows = [
+            (wav, "write_bext_chunk", 42, "public", "def write_bext_chunk(f)", "function", None),
+            (wav, "_list_info_bytes", 88, "private", "def _list_info_bytes()", "function", None),
+            (wav, "read_header", 10, "public", "def read_header(f)", "function", None),
+            (wav, "bext_version", 3, "public", "bext_version = 2", "constant", None),
+            (wav, "stamp_list_info", 120, "public", "def stamp_list_info(self)", "method", "WavWriter"),
+            # No real line: never served.
+            (wav, "bext_info_list", 0, "public", "def bext_info_list()", "function", None),
+            ("services/mixer.py", "mix_tracks", 5, "public", "def mix_tracks()", "function", None),
+        ]
+        for i, (path, name, line, vis, sig, kind, parent) in enumerate(rows):
+            qualified = f"services.wav_metadata.{parent}.{name}" if parent else name
+            session.add(
+                WikiSymbol(
+                    id=f"hit-sym-{i}",
+                    repository_id=rid,
+                    file_path=path,
+                    symbol_id=f"{path}::{name}",
+                    name=name,
+                    qualified_name=qualified,
+                    parent_name=parent,
+                    kind=kind,
+                    signature=sig,
+                    start_line=line,
+                    end_line=line + 5,
+                    visibility=vis,
+                    language="python",
+                )
+            )
+        await session.commit()
+
+    @staticmethod
+    def _fake_vector():
+        import repowise.server.mcp_server as mcp_mod
+
+        async def fake_search(query, limit=10):
+            return [
+                _mk_result(
+                    "file_page:services/wav_metadata.py",
+                    "WAV metadata",
+                    "file_page",
+                    "services/wav_metadata.py",
+                    0.8,
+                ),
+                _mk_result(
+                    "file_page:services/mixer.py", "Mixer", "file_page", "services/mixer.py", 0.6
+                ),
+            ]
+
+        mcp_mod._vector_store.search = fake_search
+
+    @pytest.mark.asyncio
+    async def test_a_prose_query_names_the_matching_symbol_and_line(
+        self, session, populated_db, setup_mcp
+    ):
+        from repowise.server.mcp_server import search_codebase
+
+        await self._seed_symbols(session, populated_db)
+        await _seed_page("file_page:services/wav_metadata.py", "services/wav_metadata.py")
+        await _seed_page("file_page:services/mixer.py", "services/mixer.py")
+        self._fake_vector()
+
+        res = await search_codebase("which function stamps bext and LIST info into wav files")
+        by_path = {r["path"]: r for r in res["results"]}
+        # Most query words first; a function outranks an equally matched constant.
+        assert by_path["services/wav_metadata.py"]["symbols"] == [
+            "WavWriter.stamp_list_info:120",
+            "_list_info_bytes:88",
+            "write_bext_chunk:42",
+        ]
+        # No symbol in the mixer shares a word with the query.
+        assert "symbols" not in by_path["services/mixer.py"]
+
+        hybrid = await search_codebase(
+            "where does wav_metadata stamp bext or mix tracks", mode="hybrid"
+        )
+        by_path = {r["path"]: r for r in hybrid["results"]}
+        # The hybrid page leg names symbols; the symbol row standing in for
+        # wav_metadata.py already names its own and gets no list.
+        assert by_path["services/mixer.py"]["symbols"] == ["mix_tracks:5"]
+        assert by_path["services/wav_metadata.py"]["type"] == "symbol"
+        assert "symbols" not in by_path["services/wav_metadata.py"]
+
+    @pytest.mark.asyncio
+    async def test_one_symbol_query_serves_every_file_row(
+        self, engine, session, populated_db, setup_mcp
+    ):
+        from sqlalchemy import event
+
+        from repowise.server.mcp_server import search_codebase
+
+        await self._seed_symbols(session, populated_db)
+        await _seed_page("file_page:services/wav_metadata.py", "services/wav_metadata.py")
+        await _seed_page("file_page:services/mixer.py", "services/mixer.py")
+        self._fake_vector()
+
+        statements: list[str] = []
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", record)
+        try:
+            res = await search_codebase("which function stamps bext and mix tracks", mode="concept")
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+        assert {r["path"] for r in res["results"] if r.get("symbols")} == {
+            "services/wav_metadata.py",
+            "services/mixer.py",
+        }
+        file_scoped = [s for s in statements if "wiki_symbols.file_path IN" in s]
+        assert len(file_scoped) == 1
+
+    def test_a_package_word_shared_by_most_hits_names_no_symbol(self):
+        from repowise.server.mcp_server._hit_symbols import _package_terms
+
+        paths = {"src/flask/app.py", "src/flask/cli.py", "src/flask/json/provider.py"}
+        # "flask" is every hit's package; "json" is one hit's topic.
+        assert _package_terms({"flask", "json", "route"}, paths) == {"flask"}
+        assert _package_terms({"flask"}, {"src/flask/app.py"}) == set()
+
+    @pytest.mark.asyncio
+    async def test_a_lone_symbol_row_gets_no_list(self, session, populated_db, setup_mcp):
+        from repowise.server.mcp_server._helpers import _resolve_repo_context
+        from repowise.server.mcp_server._hit_symbols import attach_hit_symbols
+
+        await self._seed_symbols(session, populated_db)
+        symbol_row = {"type": "symbol", "name": "write_bext_chunk", "file": "services/wav_metadata.py"}
+        page_row = {"page_type": "file_page", "target_path": "services/wav_metadata.py"}
+        ctx = await _resolve_repo_context(None)
+        await attach_hit_symbols(ctx, "stamp bext", [symbol_row, page_row])
+        assert "symbols" not in symbol_row
+        assert page_row["symbols"][0] == "write_bext_chunk:42"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_leaves_the_response_intact(
+        self, session, populated_db, setup_mcp, monkeypatch
+    ):
+        from repowise.server.mcp_server import _hit_symbols, search_codebase
+
+        await self._seed_symbols(session, populated_db)
+        await _seed_page("file_page:services/wav_metadata.py", "services/wav_metadata.py")
+        await _seed_page("file_page:services/mixer.py", "services/mixer.py")
+        self._fake_vector()
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("symbol table unavailable")
+
+        monkeypatch.setattr(_hit_symbols, "_attach", boom)
+        res = await search_codebase("which function stamps bext into wav files", mode="concept")
+        assert [r["path"] for r in res["results"]] == [
+            "services/wav_metadata.py",
+            "services/mixer.py",
+        ]
+        assert not any("symbols" in r for r in res["results"])

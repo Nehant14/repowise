@@ -178,6 +178,8 @@ from repowise.server.mcp_server.tool_answer.symbols import (
     _extract_value_answer,
     _hydrate_candidate_defines,
     _hydrate_symbols_for_hits,
+    lead_with_files,
+    place_named_files,
 )
 from repowise.server.mcp_server.tool_answer.synthesis import (
     _hash_answer_identity,
@@ -187,6 +189,7 @@ from repowise.server.mcp_server.tool_answer.synthesis import (
     _resolve_reasoning_for_answer,
     synthesize,
 )
+from repowise.server.mcp_server.tool_search_symbols import issue_files
 
 _log = logging.getLogger("repowise.mcp.answer")
 
@@ -299,6 +302,20 @@ async def _run_retrieval_pipeline(
     # Demote noise (decisions on non-why, test pages on non-test questions)
     # below real pages. Non-dropping; after anchoring, which never injects noise.
     hits = _demote_noise_hits(hits, question, is_why=_is_why_question(question))
+    # Files on a pasted stack trace lead; files defining a named identifier
+    # join just below the top three. No-op when the question has neither.
+    try:
+        issue = await issue_files(ctx, question)
+    except Exception:
+        _log.warning("get_answer: issue file lookup failed", exc_info=True)
+    else:
+        def _in_scope(paths: list[str]) -> list[str]:
+            return [p for p in paths if not scope or p.startswith(scope)]
+
+        if traced := _in_scope(issue.traced):
+            hits = lead_with_files(hits, traced)
+        if named := _in_scope(issue.named):
+            hits = place_named_files(hits, named)
     # The pre-cap ranking feeds ``candidates``: files below the synthesis cut
     # are still the best answer to "where do I look next".
     resolved_pool = list(hits)

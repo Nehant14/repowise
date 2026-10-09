@@ -136,7 +136,12 @@ def test_an_effectively_unbounded_override_is_clamped(monkeypatch, huge):
     assert _synthesis_timeout(_Provider(budget=180.0)) == _MAX_TIMEOUT_S
 
 
-@pytest.mark.parametrize("junk", ["abc", True, False, object(), -5, 0, float("nan")], ids=repr)
+# object()'s repr carries its address, which differs per xdist worker.
+@pytest.mark.parametrize(
+    "junk",
+    ["abc", True, False, object(), -5, 0, float("nan")],
+    ids=lambda v: "object()" if type(v) is object else repr(v),
+)
 def test_a_provider_declaring_junk_falls_back_instead_of_raising(junk):
     """The attribute belongs to a class that need not subclass BaseProvider.
 
@@ -464,6 +469,7 @@ async def test_both_failure_modes_return_the_same_payload_shape(reason):
         "retrieval",
         "candidates",
         "candidate_files",
+        "_candidate_file_facts",
         "best_guesses",
         "next_action_hint",
         "note",

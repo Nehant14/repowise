@@ -100,6 +100,47 @@ def serialize_candidate_files(hits: list[dict]) -> list[str]:
     return paths
 
 
+# Symbol names a shortlist row carries: enough to point at a line, not an outline.
+_SHORTLIST_FUNCTIONS = 3
+
+
+def serialize_candidate_file_facts(hits: list[dict]) -> dict[str, dict[str, Any]]:
+    """Per-path ``why`` and ``functions`` for the ``candidate_files`` pool.
+
+    Built from what retrieval already resolved, no extra query: the first hit
+    naming a file supplies the reason, and ``functions`` takes the
+    question-matched hydrated symbols first, then the indexed ``_defines``.
+    Paths with nothing to say get no entry.
+    """
+    facts: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for h in hits:
+        path = hit_file_path(h)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        row: dict[str, Any] = {}
+        why = _candidate_justification(h)
+        if why:
+            row["why"] = why
+        named: dict[str, int] = {}
+        for s in h.get("symbols") or []:
+            if s.get("_matched") and s.get("name") and s.get("start_line"):
+                named.setdefault(s["name"], s["start_line"])
+        for name, line in h.get("_defines") or ():
+            named.setdefault(name, line)
+        if named:
+            row["functions"] = [
+                {"name": name, "line": line}
+                for name, line in list(named.items())[:_SHORTLIST_FUNCTIONS]
+            ]
+        if row:
+            facts[path] = row
+        if len(seen) >= _CANDIDATE_FILES_POOL:
+            break
+    return facts
+
+
 def serialize_hits(
     hits: list[dict],
     *,

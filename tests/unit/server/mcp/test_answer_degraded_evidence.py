@@ -545,6 +545,113 @@ async def test_degraded_mines_rationale_comments_from_the_candidates(tmp_path):
     assert "code_rationale" in payload["note"]
 
 
+async def test_degraded_cites_the_retrieval_top_file_before_a_rationale_hub(
+    tmp_path, monkeypatch
+):
+    """A comment-heavy hub wins the rationale sort by volume, not by rank.
+
+    The rationale rows come back hub first; citations must still lead with the
+    file retrieval ranked first, and keep the rationale paths after it.
+    """
+    _rationale_rows(monkeypatch, "cmd/completions.go", "cmd/command.go")
+    payload = await _degraded(
+        SimpleNamespace(path=str(tmp_path), session_factory=None), _go_hits(), set()
+    )
+
+    assert payload["citations"] == [
+        "cmd/powershell_completions.go",
+        "cmd/command.go",
+        "cmd/completions.go",
+    ]
+    assert payload["code_rationale"][0]["path"] == "cmd/completions.go"
+
+
+def _rationale_rows(monkeypatch, *paths: str) -> None:
+    """Stub the rationale miner to return one row per path, in the given order."""
+    import repowise.server.mcp_server.tool_answer.degraded as degraded_mod
+
+    async def _rows(ctx, hits, fallback_targets, question):
+        return [
+            {"path": p, "lines": [100 + i, 101 + i], "comment": "c", "matched_terms": []}
+            for i, p in enumerate(paths)
+        ]
+
+    monkeypatch.setattr(degraded_mod, "_gather_code_rationale", _rows)
+
+
+def _go_hits() -> list[dict]:
+    return [
+        {"target_path": "cmd/powershell_completions.go", "title": "ps", "summary": "s", "score": 4.0},
+        {"target_path": "cmd/command.go", "title": "cmd", "summary": "s", "score": 2.0},
+    ]
+
+
+async def test_degraded_dedups_citations_across_path_forms(tmp_path, monkeypatch):
+    """A backslash rationale path names the same file as the slash guess."""
+    _rationale_rows(monkeypatch, "cmd\\command.go", "cmd\\completions.go")
+    payload = await _degraded(
+        SimpleNamespace(path=str(tmp_path), session_factory=None), _go_hits(), set()
+    )
+
+    assert payload["citations"] == [
+        "cmd/powershell_completions.go",
+        "cmd/command.go",
+        "cmd\\completions.go",
+    ]
+
+
+async def test_degraded_citations_unchanged_when_rationale_adds_nothing(tmp_path, monkeypatch):
+    """Rationale only on the body's own file: no ranked files join the citations."""
+    _rationale_rows(monkeypatch, "src/flask/app.py")
+    hits = [
+        *_hits(end_line=6),
+        {"target_path": "src/flask/other.py", "title": "o", "summary": "s", "score": 2.0},
+    ]
+    payload = await _degraded(_tree(tmp_path), hits, {"Flask"})
+
+    assert payload["citations"] == ["src/flask/app.py"]
+
+
+async def test_degraded_cites_rationale_alone_without_best_guesses(tmp_path, monkeypatch):
+    _rationale_rows(monkeypatch, "cmd/completions.go")
+    payload = await _degraded(SimpleNamespace(path=str(tmp_path), session_factory=None), [], set())
+
+    assert "best_guesses" not in payload
+    assert payload["citations"] == ["cmd/completions.go"]
+
+
+async def test_degraded_body_path_then_guesses_then_rationale(tmp_path, monkeypatch):
+    _rationale_rows(monkeypatch, "src/flask/hub.py")
+    hits = [
+        *_hits(end_line=6),
+        {"target_path": "src/flask/other.py", "title": "o", "summary": "s", "score": 2.0},
+    ]
+    payload = await _degraded(_tree(tmp_path), hits, {"Flask"})
+
+    assert payload["symbol_bodies"][0]["path"] == "src/flask/app.py"
+    assert payload["citations"] == ["src/flask/app.py", "src/flask/other.py", "src/flask/hub.py"]
+
+
+def test_degraded_citing_the_guesses_does_not_grow_the_served_files():
+    """Ranked guesses moved into citations keep their candidate_files slots."""
+    from repowise.server.mcp_server.tool_answer.projection import _shape_candidate_files
+
+    pool = ["top.go", "a.go", "b.go", "c.go", "d.go", "e.go", "f.go"]
+
+    def served(citations: list[str]) -> set[str]:
+        payload = {
+            "degraded": "no-llm-provider",
+            "citations": citations,
+            "best_guesses": [{"file": "top.go"}],
+            "code_rationale": [{"path": "hub.go", "lines": [1, 2]}],
+            "candidate_files": list(pool),
+        }
+        _shape_candidate_files(payload, expanded=False)
+        return set(payload["citations"]) | set(payload.get("candidate_files") or [])
+
+    assert served(["top.go", "hub.go"]) == served(["hub.go"])
+
+
 async def test_degraded_does_not_ship_the_excerpt_twice(tmp_path):
     """`best_guesses[].excerpt` and `retrieval[].excerpt` are the same bytes.
 
@@ -556,9 +663,14 @@ async def test_degraded_does_not_ship_the_excerpt_twice(tmp_path):
     hits[0]["excerpt"] = "x" * 1500
     payload = await _degraded(ctx, hits, {"Blueprint"})
 
-    external = project_answer_payload(payload, question="what is Blueprint")
+    external = project_answer_payload(
+        payload, question="what is Blueprint", include=["evidence"]
+    )
     assert external["best_guesses"][0]["excerpt"] == "x" * 1500
-    assert "retrieval" not in external
+    # The default low shape serves the guess without its excerpt.
+    compact = project_answer_payload(payload, question="what is Blueprint")
+    assert "excerpt" not in compact["best_guesses"][0]
+    assert "retrieval" not in compact
 
 
 async def test_degraded_keeps_the_guess_excerpt_when_nothing_duplicates_it(tmp_path):

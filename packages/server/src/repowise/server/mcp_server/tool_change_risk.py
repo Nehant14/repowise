@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import subprocess
 import threading
 import time
@@ -129,6 +130,18 @@ _DIAGNOSTIC_FIELDS = (
     "fallback_band",
 )
 
+#: Comparison mechanics on ``health_delta``: the analyzer fingerprint, the two
+#: resolved revisions and the fixed limits text. Behind ``diagnostics`` too.
+_HEALTH_DIAGNOSTIC_FIELDS = ("analyzer", "base", "head", "limits")
+
+#: ``classification`` labels for the MCP surface. ``review_priority`` is a
+#: tercile of the diff-shape rank, so the label names size, not a verdict.
+_DIFF_SIZE_LABELS = {
+    "low": "Below-typical diff size",
+    "moderate": "Typical diff size",
+    "high": "Above-typical diff size",
+}
+
 
 @mcp.tool(
     surface_order=60,
@@ -153,15 +166,15 @@ async def get_change_risk(
     them, name their ``attribution`` basis, and sort change-written above
     pre-existing.
 
-    Trust ``health_delta.status``: ``partial`` means files were skipped and the
-    change is not cleared.
+    ``directive.status`` is the verdict; ``partial`` health means code files
+    were skipped. ``review_priority``, ``classification`` and ``diff_shape``
+    measure diff size only, not danger.
 
     ``impacted_tests`` keeps measured coverage and inferred candidates distinct.
     ``patch_coverage`` is the share of changed executable lines stored coverage
     ran; ``hints`` name tests to extend. ``fix_history`` is the changed files'
     bug-fix record, ``overlap`` the past fixes on these exact lines,
-    ``branch_overlap`` other branches editing them. ``diff_shape`` is one line
-    on size, not a danger verdict. An empty diff returns
+    ``branch_overlap`` other branches editing them. An empty diff returns
     ``status: "nothing_to_score"``.
 
     Args:
@@ -173,7 +186,7 @@ async def get_change_risk(
         include_paths: Gitignore-style paths to keep, as a list or one
             comma-separated string, e.g. ``"src/api/,src/db/"``. Omit for all.
         baseline: Recent commits sampled for percentile ranking; 0 disables it.
-        include: ``"findings"``, ``"diagnostics"`` (raw score mechanics) or
+        include: ``"findings"``, ``"diagnostics"`` (raw mechanics) or
             ``"scales"`` (units).
         finding_id: Expand one ``health_delta`` finding by its id.
     """
@@ -204,6 +217,8 @@ async def get_change_risk(
         if resolve_enum_argument(block, _INCLUDE_BLOCKS, argument="include", ignored=ignored)
     }
     payload = change_risk_payload(result, scales="scales" in include_set)
+    if payload.get("review_priority") in _DIFF_SIZE_LABELS:
+        payload["classification"] = _DIFF_SIZE_LABELS[payload["review_priority"]]
     if "diagnostics" not in include_set:
         diagnostics = {f: payload.pop(f) for f in _DIAGNOSTIC_FIELDS if f in payload}
         payload["fix_history"].pop("density", None)
@@ -295,7 +310,13 @@ async def get_change_risk(
     payload["diff_shape"] = _diff_shape_sentence(payload, diagnostics)
     if independent is not None:
         payload["independent_changes"] = independent
-    _attach_health(payload, delta, revspec, expand="findings" in include_set)
+    _attach_health(
+        payload,
+        delta,
+        revspec,
+        expand="findings" in include_set,
+        diagnostics="diagnostics" in include_set,
+    )
     # source: live_git marks that the *score* is computed from the working
     # checkout's git. The two blocks above are index-backed, so the freshness
     # fields do apply to them, scoped to the change's files. None (not []) when
@@ -434,9 +455,14 @@ async def _attach_health_references(ctx: Any, delta: Any) -> None:
         }
 
 
-def _attach_health(payload: dict, delta: Any, revspec: str | None, *, expand: bool) -> None:
+def _attach_health(
+    payload: dict, delta: Any, revspec: str | None, *, expand: bool, diagnostics: bool = False
+) -> None:
     """Put the directive first and the compact delta second."""
     block = _health_delta_block(delta, revspec=revspec)
+    if not diagnostics:
+        for key in _HEALTH_DIAGNOSTIC_FIELDS:
+            block.pop(key, None)
     if expand:
         from repowise.server.mcp_server._change_health import finding_row
 
@@ -488,7 +514,7 @@ def _diff_shape_sentence(payload: dict, diagnostics: dict) -> str:
     """
     pct = payload.get("risk_percentile")
     where = (
-        f"bigger than {round(pct)}% of this repo's recent commits"
+        f"bigger than {min(math.floor(pct), 99)}% of this repo's recent commits"
         if pct is not None
         else "unranked (no baseline to compare against)"
     )

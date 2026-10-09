@@ -42,6 +42,8 @@ Returns a flat dict (not wrapped in `targets`) so the agent can pipe the
 
 from __future__ import annotations
 
+import functools
+import json
 import re
 import sqlite3
 import time
@@ -55,6 +57,7 @@ from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import WikiSymbol
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server._budget import register_post_shed
+from repowise.server.mcp_server._budget.contracts import DEFAULT_RESPONSE_CHARS
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
@@ -82,7 +85,11 @@ from repowise.server.mcp_server._symbol_lookup import (
     resolve_symbol_rows,
     symbol_id_variants,
 )
-from repowise.server.mcp_server._verify import check_symbol_bounds, heal_symbol_row
+from repowise.server.mcp_server._verify import (
+    check_symbol_bounds,
+    heal_symbol_row,
+    parse_live_symbols,
+)
 
 _log = __import__("logging").getLogger("repowise.mcp.symbol")
 
@@ -94,6 +101,18 @@ _log = __import__("logging").getLogger("repowise.mcp.symbol")
 # token cost (S1 dogfood). The rare overflow gets a clean `continuation`
 # token rather than a guessed range read.
 _MAX_SOURCE_LINES = 600
+
+# A container whose served body would exceed this is outlined instead: its
+# header plus each member's signature, lines and id. Half the default reply
+# budget, so smaller classes keep the one-call whole body, while a class big
+# enough to crowd out the rest of the reply is usually wanted for its shape.
+_OUTLINE_MIN_CHARS = DEFAULT_RESPONSE_CHARS // 2
+_CONTAINER_KINDS = frozenset({"class", "interface", "struct", "enum", "trait", "impl", "module"})
+# Header lines (decorators, declaration, docstring head) served above members.
+_OUTLINE_HEADER_LINES = 12
+_OUTLINE_SUMMARY_CHARS = 160
+# Serialized chars of member rows listed; the rest are counted in members_total.
+_OUTLINE_MEMBER_CHARS = DEFAULT_RESPONSE_CHARS // 2
 
 # Range-read dispatch: "path/to/file.py:140-180". A single colon followed by
 # a numeric range never collides with "{path}::{name}" (double colon) or an
@@ -766,6 +785,73 @@ def _number_lines(source: str, start_line: int) -> str:
     return "\n".join(f"{n:>6}\t{line}" for n, line in enumerate(source.splitlines(), start_line))
 
 
+async def _container_outline(
+    session_factory: Any, repo_id: str, row: WikiSymbol, text: str, start: int, end: int
+) -> tuple[list[dict[str, Any]], int, int] | None:
+    """Direct members of the container *row* spanning ``start``-``end``, as outline rows.
+
+    Returns the listed rows (capped at ``_OUTLINE_MEMBER_CHARS``), the line the
+    first member starts on and the member total, or None when the index holds
+    no members to outline. Each member is verified against the live file,
+    parsing it at most once for the whole set.
+
+    Members are matched by parent name inside the container's own lines, so
+    Rust impl blocks and Go receiver methods declared outside a struct do not
+    outline it.
+    """
+    async with get_session(session_factory) as session:
+        res = await session.execute(
+            select(WikiSymbol).where(
+                WikiSymbol.repository_id == repo_id,
+                WikiSymbol.file_path == row.file_path,
+                WikiSymbol.parent_name == row.name,
+                WikiSymbol.id != row.id,
+            )
+        )
+        rows = list(res.scalars().all())
+    _parsed = functools.cache(lambda: parse_live_symbols(row, text))
+    members: list[dict[str, Any]] = []
+    for member in rows:
+        check = check_symbol_bounds(member, text, _parsed)
+        # A same-named container elsewhere in the file shares the parent name;
+        # an unverified member is judged by its indexed range instead.
+        if check.approximate:
+            if not start <= member.start_line <= member.end_line <= end:
+                continue
+        elif not start <= check.start_line <= end:
+            continue
+        entry: dict[str, Any] = {
+            "symbol_id": symbol_identity(member.symbol_id),
+            "kind": member.kind,
+            "signature": _clean_symbol_signature(member.signature),
+            "start_line": check.start_line,
+            "end_line": check.end_line,
+        }
+        summary = (member.docstring or "").strip().splitlines()
+        if summary:
+            entry["summary"] = summary[0][:_OUTLINE_SUMMARY_CHARS]
+        if check.approximate:
+            entry["bounds"] = "approximate"
+        members.append(entry)
+    if not members:
+        return None
+    members.sort(key=lambda m: m["start_line"])
+    # Overloads share one id, and get_symbol on it already serves every one.
+    unique: dict[str, dict[str, Any]] = {}
+    for entry in members:
+        unique.setdefault(entry["symbol_id"], entry)
+    members = list(unique.values())
+    first = min((m["start_line"] for m in members if "bounds" not in m), default=end + 1)
+    listed: list[dict[str, Any]] = []
+    remaining = _OUTLINE_MEMBER_CHARS
+    for entry in members:
+        remaining -= len(json.dumps(entry)) + 2
+        if remaining < 0:
+            break
+        listed.append(entry)
+    return listed, first, len(members)
+
+
 async def _render_ambiguous(
     rows: list[WikiSymbol],
     symbol_id: str,
@@ -1115,10 +1201,36 @@ async def get_symbol(
         await heal_symbol_row(ctx.session_factory, row, check.start_line, check.end_line)
 
     source, start, end, _total = _slice_text(text, check.start_line, check.end_line, context_lines)
+    numbered = _number_lines(source, start)
 
     truncated = (end - start + 1) >= _MAX_SOURCE_LINES and (
         check.end_line - check.start_line + 1 + 2 * context_lines
     ) > _MAX_SOURCE_LINES
+
+    outline = None
+    if row.kind in _CONTAINER_KINDS and check.verified:
+        # Sized on the body alone, so context_lines never tips a class into an outline.
+        bare, bare_start, _e, _t = _slice_text(text, check.start_line, check.end_line, 0)
+        if len(_number_lines(bare, bare_start)) > _OUTLINE_MIN_CHARS:
+            outline = await _container_outline(
+                ctx.session_factory, repository.id, row, text, check.start_line, check.end_line
+            )
+    if outline is not None:
+        members, first_member, members_total = outline
+        header_end = min(
+            first_member - 1, check.start_line + _OUTLINE_HEADER_LINES - 1, check.end_line
+        )
+        # context_lines widens the header upward only; below it are the members.
+        source, start, end, _total = _slice_text(
+            text,
+            max(1, check.start_line - context_lines),
+            max(check.start_line, header_end),
+            0,
+        )
+        source = source.rstrip()
+        end = start + len(source.splitlines()) - 1 if source else start
+        numbered = _number_lines(source, start)
+        truncated = False
 
     response = {
         "symbol_id": symbol_identity(row.symbol_id),
@@ -1132,7 +1244,7 @@ async def get_symbol(
         "end_line": end,
         "symbol_start_line": check.start_line,
         "symbol_end_line": check.end_line,
-        "source": _number_lines(source, start),
+        "source": numbered,
         "truncated": truncated,
         "verified": check.verified,
         "_meta": _build_meta(
@@ -1143,7 +1255,24 @@ async def get_symbol(
             targets=[row.file_path],
         ),
     }
-    if not truncated and check.verified:
+    if outline is not None:
+        # An outline is not the body, so it never claims ``_meta.complete``.
+        response["outlined"] = True
+        response["members"] = members
+        response["note"] = (
+            f"Body ({check.start_line}-{check.end_line}) outlined: header plus "
+            f"{len(members)} members. Fetch one member with get_symbol on its "
+            f"symbol_id, or Read {row.file_path} lines "
+            f"{check.start_line}-{check.end_line} for the whole body."
+        )
+        if members_total > len(members):
+            response["members_total"] = members_total
+            last = members[-1]["end_line"] if members else check.start_line
+            response["note"] += (
+                f" {members_total - len(members)} more members are not listed;"
+                f" they start after line {last}."
+            )
+    elif not truncated and check.verified:
         # The whole body was served against live bytes, so nothing is left to
         # fetch for this symbol.
         response["_meta"]["complete"] = _completeness_line(bodies=1)
@@ -1175,7 +1304,8 @@ async def get_symbol(
             "the indexed line range from the current file contents; verify "
             "before citing."
         )
-    if depth > 1:
+    # An outline answers for the shape; callee bodies would undo its size.
+    if depth > 1 and outline is None:
         async with get_session(ctx.session_factory) as session:
             callee_block = await _expand_callees(
                 session,

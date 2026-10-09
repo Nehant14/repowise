@@ -99,10 +99,8 @@ def project_risk(payload: dict) -> dict:
     timing half of ``_meta``, and the per-target keys named above.
 
     ``pr_blast_radius`` survives although ``directive`` summarises much of it,
-    because ``recommended_reviewers`` has no substitute anywhere else in the
-    response, and because the tool has *already* capped its four noisy lists
-    (15/10/10/5) before it gets here — so the block a caller would most want is
-    the one an allowlist would silently discard, at almost no size.
+    because the tool has *already* capped its four noisy lists (15/10/10/5)
+    before it gets here, so keeping it costs almost nothing.
     """
     out: dict = {}
     if payload.get("directive"):
@@ -142,8 +140,9 @@ def _target_risk(
         return get_risk(
             targets=list(targets),
             changed_files=list(changed_files) or None,
-            # _render_target_risk prints risk_type and change_magnitude.
-            include=["churn"],
+            # _render_target_risk prints risk_type and change_magnitude; --format
+            # json keeps the PR blast radius the tool serves only on request.
+            include=["churn", "blast"],
         )
 
     payload = _ta.run(repo, _factory, "get_risk")
@@ -171,7 +170,6 @@ def _render_target_risk(projected: dict, requested: tuple[str, ...]) -> None:
         console.print(f"\n[bold]Directive[/bold] {escape(str(directive.get('summary', '')))}")
         for label, key in (
             ("May break", "may_break"),
-            ("Tests that may break", "may_break_tests"),
             ("Missing co-changes", "missing_cochanges"),
             ("Files without tests", "missing_tests"),
             ("Tests to run", "tests_to_run"),

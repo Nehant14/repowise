@@ -19,6 +19,7 @@ import {
   EnvVarLine,
   type SaveState,
 } from "@repowise-dev/ui/settings";
+import { useTranslations } from "next-intl";
 
 /**
  * Fallback only, for a cold load and for an API that never answers. The server
@@ -38,11 +39,11 @@ const FLAG_ONLY_PROVIDERS = ["mock"] as const;
 const MODEL_PLACEHOLDERS: Record<string, string> = {
   gemini: "gemini-3.5-flash-lite",
   openai: "gpt-5.6-luna",
-  anthropic: "claude-haiku-4-5",
+  anthropic: "claude-haiku-5-5",
   deepseek: "deepseek-v4-flash",
   kimi: "kimi-for-coding",
   edenai: "mistral/mistral-small-latest",
-  claude_cli: "claude_cli/claude-haiku-4-5",
+  claude_cli: "claude_cli/claude-haiku-5-5",
   opencode: "opencode/default",
   ollama: "qwen3.5:4b",
   litellm: "groq/llama-3.1-70b-versatile",
@@ -88,6 +89,7 @@ const EMBEDDER_ENV_VARS: Record<string, string[]> = {
  * here where it belongs.
  */
 export function ProviderSection() {
+  const t = useTranslations("settings");
   const [provider, setProvider] = useState("gemini");
   const [model, setModel] = useState("");
   const [embedder, setEmbedder] = useState("mock");
@@ -171,22 +173,25 @@ export function ProviderSection() {
 
   return (
     <OverviewSection
-      title="Model defaults"
+      title={t("provider.title")}
       description={
         serverProvider
-          ? `Used when you trigger init or sync from this dashboard. The server itself is currently configured with ${serverProvider}.`
-          : "Used when you trigger init or sync from this dashboard."
+          ? t("provider.descriptionWithServer", { provider: serverProvider })
+          : t("provider.description")
       }
       action={<SaveIndicator state={saveState} />}
     >
       <SettingsRows>
         <SettingsRow
-          label="Provider"
+          label={t("provider.providerLabel")}
           hint={providerInfo?.installHint}
         >
           <div className="space-y-2">
             <Select value={provider} onValueChange={handleProviderChange}>
-              <SelectTrigger aria-label="Provider" className="w-full sm:w-64">
+              <SelectTrigger
+                aria-label={t("provider.providerAria")}
+                className="w-full sm:w-64"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -202,9 +207,9 @@ export function ProviderSection() {
         </SettingsRow>
 
         <SettingsRow
-          label="Model"
+          label={t("provider.modelLabel")}
           htmlFor="model"
-          hint="Leave blank to use the provider's default."
+          hint={t("provider.modelHint")}
         >
           <Input
             id="model"
@@ -220,12 +225,15 @@ export function ProviderSection() {
         </SettingsRow>
 
         <SettingsRow
-          label="Embedder"
-          hint="What semantic search is built from. The mock embedder disables it."
+          label={t("provider.embedderLabel")}
+          hint={t("provider.embedderHint")}
         >
           <div className="space-y-2">
             <Select value={embedder} onValueChange={handleEmbedderChange}>
-              <SelectTrigger aria-label="Embedder" className="w-full sm:w-64">
+              <SelectTrigger
+                aria-label={t("provider.embedderAria")}
+                className="w-full sm:w-64"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -239,32 +247,17 @@ export function ProviderSection() {
             {embedder === "mock" ? (
               <EnvVarLine
                 vars={[]}
-                note={
-                  <>
-                    Semantic search is off. Set{" "}
-                    <code className="font-mono text-[var(--color-text-secondary)]">
-                      REPOWISE_EMBEDDER=gemini
-                    </code>{" "}
-                    or{" "}
-                    <code className="font-mono text-[var(--color-text-secondary)]">
-                      REPOWISE_EMBEDDER=openai
-                    </code>{" "}
-                    on the server for real retrieval.
-                  </>
-                }
+                note={t.rich("provider.embedderOffNote", {
+                  code: (chunks) => <code className="font-mono text-[var(--color-text-secondary)]">{chunks}</code>,
+                })}
               />
             ) : (
               <EnvVarLine
                 vars={embedderVars}
-                note={
-                  <>
-                    Set{" "}
-                    <code className="font-mono text-[var(--color-text-secondary)]">
-                      REPOWISE_EMBEDDER={embedder}
-                    </code>{" "}
-                    on the server.
-                  </>
-                }
+                note={t.rich("provider.embedderOnNote", {
+                  code: (chunks) => <code className="font-mono text-[var(--color-text-secondary)]">{chunks}</code>,
+                  env: `REPOWISE_EMBEDDER=${embedder}`,
+                })}
               />
             )}
           </div>
