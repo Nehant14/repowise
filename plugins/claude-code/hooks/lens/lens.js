@@ -3903,7 +3903,7 @@ function isClear(risk) {
   return risk.directive?.status === "clear_in_analyzed_scope";
 }
 function header2(risk, changed) {
-  return `Change review (${reviewScope(risk.ref ?? "working tree", risk.working_tree !== false, changed)})`;
+  return `Change review (${reviewScope(risk.ref ?? "working tree", risk.working_tree === true, changed)})`;
 }
 function findingSegments(hd) {
   const rows = hd?.top_findings ?? [];
